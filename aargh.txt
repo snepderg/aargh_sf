@@ -1,0 +1,776 @@
+--@name Aargh!
+--@author Snepderg
+--@server
+
+-- Aargh! - An Esoteric Programming Language by Sascha Wilde - https://esolangs.org/wiki/Argh
+
+--[[
+-- Aargh! is a simple esoteric programming language that operates on a 2D grid of cells, along with a stack for data.
+-- The program begins execution at the top-left corner of the grid, and moves right by default.
+-- Data is stored as characters in each cell, and can be manipulated by the program.
+-- To read data from a cell, the program must convert the character to its ASCII value.
+-- As part of its esoteric nature, Aargh! has a series of commands that can be executed, each with a somewhat unintuitive character.
+-- When any sort of error occurs during execution, the program will throw an error with the message "Aargh!" instead of telling the user what went wrong,
+-- but there isn't much I can do to obfuscate the stack trace that Lua throws.
+
+-- Note: Due to development issues, I opted to make the script store data as ASCII values instead of characters. I am unsure if this is how it is supposed to behave, but so far it works.
+]]
+
+wire.adjustInputs( { "Step" }, { "NUMBER" } )
+wire.adjustOutputs( {
+    "STDOUT",
+    "POINTER_DIR",
+    "CHAR",
+    "POINTERX",
+    "POINTERY",
+    "STEP",
+    "COMPLETE",
+    "INPUTSTR",
+    "STACK"
+},
+{
+    "STRING",
+    "STRING",
+    "STRING",
+    "STRING",
+    "STRING",
+    "STRING",
+    "STRING",
+    "STRING",
+    "STRING"
+} )
+
+-- CONFIG --
+local stdoutPrintEnabled = false -- true or false. If true, the program will print stdout.
+local programStepInterval = 0.2 -- How long to wait between program steps. If 0, it will execute on the next tick.
+local errorOnAargh = true -- true or false. If true, the program will throw an error with the message "Aargh!" when an error in the program occurs.
+-- CONFIG END --
+
+
+-- SETUP --
+ -- Flag to indicate if the program has halted execution
+ --local programHalted = false
+
+local function aargh()
+    if errorOnAargh then
+        error( "Aargh!" )
+    end
+
+    wire.ports.STDOUT = "Aargh!"
+
+    --programHalted = true
+end
+
+-- Instruction pointer begins off-grid to the left.
+-- This is because the program moves the pointer then executes the action at that grid cell.
+-- Doing this ensures that the instruction pointer begins execution at 1, 1.
+local pointerX = 0
+local pointerY = 1
+
+local DIR_LEFT = 1
+local DIR_DOWN = 2
+local DIR_UP = 3
+local DIR_RIGHT = 4
+
+local debugDir = {
+    "LEFT", "DOWN", "UP", "RIGHT"
+}
+
+local executionDirection = DIR_RIGHT -- Default execution direction for Aargh!
+local MAX_COLUMNS = 80 -- Hardcoded boundary for Aargh!
+
+local programHeight = 0 -- How many rows the program has. Grid setup changes this
+local programWidth = 0 -- How many columns the program has. Grid setup changes this
+
+-- Character ASCII Values --
+local VALUE_SPACE = 32
+local VALUE_EOF = 26
+
+-- Stack --
+local stack = {
+    data = {}
+}
+
+stack.push = function( value )
+    --print( "PUSHED:" .. value )
+
+    table.insert( stack.data, 1, value )
+end
+
+stack.pop = function()
+    if #stack.data == 0 then
+        aargh()
+        return
+    end
+
+    local value = table.remove( stack.data, 1 )
+
+    if not tonumber( value ) then
+        value = string.byte( value )
+    end
+
+    --print( "POPPED: " .. value )
+
+    return value
+end
+
+stack.peek = function()
+    if #stack.data == 0 then
+        aargh()
+        return
+    end
+
+    local value = stack.data[1]
+    --print( "PEEKED: " .. value )
+
+    return value
+end
+
+-- I/O --
+local stdin
+local stdout = ""
+
+-- Init functions (code flow) --
+local movePointer
+local pointIsInBounds
+local rotateDirLeft
+local rotateDirRight
+
+local getAboveCellValue
+local getBelowCellValue
+local getCellValue
+
+local setCellAbove
+local setCellBelow
+local setCell
+
+local grid = {}
+
+-- Commands Registry --
+-- TODO: implement jump commands ("H", "J", "K", "L")
+local commands = {
+    -- Add value of the cell above the current cell to the value on top of the stack
+    A = function()
+        --print( "A called" )
+        wire.ports.CHAR = "A"
+        local value = stack.pop()
+        stack.push( value + getAboveCellValue( pointerX, pointerY ) )
+    end,
+    -- Add value of the cell below the current cell to the value on top of the stack
+    a = function()
+        wire.ports.CHAR = "a"
+        --print( "a called" )
+        local value = stack.pop()
+        stack.push( value + getBelowCellValue( pointerX, pointerY ) )
+    end,
+    -- Delete top value off of the stack
+    D = function()
+        wire.ports.CHAR = "D"
+        --print( "D called" )
+        stack.pop()
+    end,
+    -- Duplicate top value on top of the stack
+    d = function()
+        wire.ports.CHAR = "d"
+        --print( "d called" )
+        local value = stack.peek()
+        stack.push( value )
+    end,
+    -- Insert value of system EOF in the cell above
+    E = function()
+        wire.ports.CHAR = "E"
+        --print( "E called" )
+        setCellAbove( VALUE_EOF )
+    end,
+    -- Insert value of system EOF in the cell below
+    e = function()
+        wire.ports.CHAR = "e"
+        --print( "e called" )
+        setCellBelow( VALUE_EOF )
+    end,
+    -- Fetch (pop) the value from the top of the stack and store in the cell above
+    F = function()
+        wire.ports.CHAR = "F"
+        --print( "F called" )
+        local value = stack.pop()
+        setCellAbove( pointerX, pointerY, value )
+    end,
+    -- Fetch (pop) the value from the top of the stack and store in the cell below
+    f = function()
+        wire.ports.CHAR = "f"
+        --print( "f called" )
+        local value = stack.pop()
+        setCellBelow( pointerX, pointerY, value )
+    end,
+    -- Get one byte from stdin and store it in the cell above
+    G = function()
+        wire.ports.CHAR = "G"
+        --print( "G called" )
+        local value = stdin:sub( 1, 1 )
+        stdin = stdin:sub( 2 )
+        setCellAbove( pointerX, pointerY, value )
+    end,
+    -- Get one byte from stdin and store it in the cell below
+    g = function()
+        wire.ports.CHAR = "g"
+        --print( "g called" )
+        local value = stdin:sub( 1, 1 )
+        stdin = stdin:sub( 2 )
+        setCellBelow( pointerX, pointerY, value )
+    end,
+    -- jump (move instruction pointer) left to the next cell whose value matches the value on top of the stack, and set execution direction to "left"
+    H = function()
+        wire.ports.CHAR = "H"
+        --print( "H called" )
+        local value = stack.peek()
+        local x = pointerX
+        local y = pointerY
+
+        while pointIsInBounds( x, y ) do
+            x = x - 1
+
+            if getCellValue( x, y ) == value then
+                pointerX = x
+                pointerY = y
+                executionDirection = DIR_LEFT
+
+                break
+            end
+        end
+
+        if not pointIsInBounds( x, y ) then
+            aargh()
+            return
+        end
+    end,
+    -- Set execution direction "left"
+    h = function()
+        wire.ports.CHAR = "h"
+        --print( "h called" )
+        if executionDirection ~= DIR_LEFT then
+            executionDirection = DIR_LEFT
+        end
+    end,
+    -- Jump (move instruction pointer) down to the next cell whose value matches the value on top of the stack, and set execution direction to "down"
+    J = function()
+        wire.ports.CHAR = "J"
+        --print( "J called" )
+        local value = stack.peek()
+        local x = pointerX
+        local y = pointerY
+
+        while pointIsInBounds( x, y ) do
+            y = y + 1
+
+            local cellValue = getCellValue( x, y )
+            if cellValue == value then
+                pointerX = x
+                pointerY = y
+                executionDirection = DIR_DOWN
+
+                break
+            end
+        end
+
+        if not pointIsInBounds( x, y ) then
+            aargh()
+            return
+        end
+    end,
+    -- Set execution direction "down"
+    j = function()
+        wire.ports.CHAR = "j"
+        --print( "j called" )
+        if executionDirection ~= DIR_DOWN then
+            executionDirection = DIR_DOWN
+        end
+    end,
+    -- Jump (move instruction pointer) up to the next cell whose value matches the value on top of the stack, and set execution direction to "up"
+    K = function()
+        wire.ports.CHAR = "K"
+        --print( "K called" )
+        local value = stack.peek()
+        local x = pointerX
+        local y = pointerY
+
+        while pointIsInBounds( x, y ) do
+            y = y - 1
+
+            if getCellValue( x, y ) == value then
+                pointerX = x
+                pointerY = y
+                executionDirection = DIR_UP
+
+                break
+            end
+        end
+
+        if not pointIsInBounds( x, y ) then
+            aargh()
+            return
+        end
+    end,
+    -- Set execution direction "up"
+    k = function()
+        wire.ports.CHAR = "k"
+        --print( "k called" )
+        if executionDirection ~= DIR_UP then
+            executionDirection = DIR_UP
+        end
+    end,
+    -- Jump (move instruction pointer) right to the next cell whose value matches the value on top of the stack, and set execution direction to "right"
+    L = function()
+        wire.ports.CHAR = "L"
+        --print( "L called" )
+        local value = stack.peek()
+        local x = pointerX
+        local y = pointerY
+
+        while pointIsInBounds( x, y ) do
+            x = x + 1
+
+            if getCellValue( x, y ) == value then
+                pointerX = x
+                pointerY = y
+                executionDirection = DIR_RIGHT
+
+                break
+            end
+        end
+
+        if not pointIsInBounds( x, y ) then
+            aargh()
+            return
+        end
+    end,
+    -- Set execution direction "right"
+    l = function()
+        wire.ports.CHAR = "l"
+        --print( "l called" )
+        if executionDirection ~= DIR_RIGHT then
+            executionDirection = DIR_RIGHT
+        end
+    end,
+    -- Send value above the current cell to stdout
+    P = function()
+        wire.ports.CHAR = "P"
+        --print( "P called" )
+        stdout = stdout .. string.utf8char( getAboveCellValue( pointerX, pointerY ) )
+        wire.ports.STDOUT = stdout
+
+        if stdoutPrintEnabled then
+            --print( stdout )
+        end
+    end,
+    -- Send value below the current cell to stdout
+    p = function()
+        wire.ports.CHAR = "p"
+        --print( "p called" )
+        stdout = stdout .. string.utf8char( getBelowCellValue( pointerX, pointerY ) )
+        wire.ports.STDOUT = stdout
+
+        if stdoutPrintEnabled then
+            --print( stdout )
+        end
+    end,
+    -- Reduce the value on top of the stack by the value of the cell above
+    R = function()
+        wire.ports.CHAR = "R"
+        --print( "R called" )
+        local value = stack.pop()
+        local aboveValue = getAboveCellValue( pointerX, pointerY )
+        local newValue = value - aboveValue
+        --print( "SUB: " .. value .. " - " .. aboveValue .. " = " .. newValue )
+        stack.push( newValue )
+    end,
+    -- Reduce the value on top of the stack by the value of the cell below
+    r = function()
+        wire.ports.CHAR = "r"
+        --print( "r called" )
+        local value = stack.pop()
+        local belowValue = getBelowCellValue( pointerX, pointerY )
+        local newValue = value - belowValue
+        --print( "SUB: " .. value .. " - " .. belowValue .. " = " .. newValue )
+        stack.push( newValue )
+    end,
+    -- Store (push) the value of the cell above to the stack
+    S = function()
+        wire.ports.CHAR = "S"
+        --print( "S called" )
+        stack.push( getAboveCellValue( pointerX, pointerY ) )
+    end,
+    -- Store (push) the value of the cell below to the stack
+    s = function()
+        wire.ports.CHAR = "s"
+        --print( "s called" )
+        stack.push( getBelowCellValue( pointerX, pointerY ) )
+    end,
+    -- If the value on top of the stack is negative, rotate the execution direction 90 degrees to the left
+    X = function()
+        wire.ports.CHAR = "X"
+        --print( "X called" )
+        if stack.peek() < 0 then
+            rotateDirLeft()
+        end
+    end,
+    -- If the value on top of the stack is positive, rotate the execution direction 90 degrees to the right
+    x = function()
+        wire.ports.CHAR = "x"
+
+        local value = stack.peek()
+
+        if value > 0 then
+            rotateDirRight()
+        end
+    end,
+    -- Behaves just like 'j', but only if its position in the code/data array is 0,0 (the left/top corner) and only if there is a '!' in the cell on its right side.
+    ["#"] = function()
+        wire.ports.CHAR = "#"
+        --print( "# called" )
+        if pointerX == 1 and pointerY == 1 then
+            local rightCellChar = getCellValue( { pointerX + 1, pointerY } )
+
+            if rightCellChar == "!" then
+                executionDirection = DIR_DOWN
+            end
+        end
+    end
+}
+
+
+-- FUNCTIONS --
+movePointer = function()
+    local oldPointerX = pointerX
+    local oldPointerY = pointerY
+
+    if executionDirection == DIR_LEFT then
+        pointerX = pointerX - 1
+    elseif executionDirection == DIR_DOWN then
+        pointerY = pointerY + 1
+    elseif executionDirection == DIR_UP then
+        pointerY = pointerY - 1
+    else -- DIR_RIGHT
+        pointerX = pointerX + 1
+    end
+
+    wire.ports.POINTERX = tostring( pointerX )
+    wire.ports.POINTERY = tostring( pointerY )
+    --print( "POINTER: { " .. oldPointerX .. ", " .. oldPointerY .. " } -> { " .. pointerX .. ", " .. pointerY .. " }" )
+end
+
+-- TODO: Rewrite inline with movePointer
+rotateDirLeft = function()
+    if executionDirection == DIR_LEFT then
+        executionDirection = DIR_DOWN
+    elseif executionDirection == DIR_DOWN then
+        executionDirection = DIR_RIGHT
+    elseif executionDirection == DIR_RIGHT then
+        executionDirection = DIR_UP
+    else -- DIR_UP
+        executionDirection = DIR_LEFT
+    end
+end
+
+-- TODO: Rewrite inline with movePointer
+rotateDirRight = function()
+    if executionDirection == DIR_LEFT then
+        executionDirection = DIR_UP
+    elseif executionDirection == DIR_UP then
+        executionDirection = DIR_RIGHT
+    elseif executionDirection == DIR_RIGHT then
+        executionDirection = DIR_DOWN
+    else -- DIR_DOWN
+        executionDirection = DIR_LEFT
+    end
+end
+
+pointIsInBounds = function ( x, y )
+    local x, y = y, x
+    local pointInBounds = ( x >= 1 and x <= programHeight ) and ( y >= 1 and y <= programWidth )
+    --print( "POINT IN BOUNDS: " .. tostring( pointInBounds ):upper() )
+
+    if not pointInBounds then
+        print( "OUT OF BOUNDS: ", pointerX, pointerY )
+    end
+
+    return pointInBounds
+end
+
+getAboveCellValue = function ( x, y )
+    y = y - 1
+
+    if not pointIsInBounds( x, y ) then
+        aargh()
+        return
+    end
+
+    local cellValue = getCellValue( x, y )
+    return cellValue
+end
+
+getBelowCellValue = function ( x, y )
+    y = y + 1
+
+    if not pointIsInBounds( x, y ) then
+        aargh()
+        return
+    end
+
+    local cellValue = getCellValue( x, y )
+    return cellValue
+end
+
+getCellValue = function ( x, y )
+    if not pointIsInBounds( x, y ) then
+        aargh()
+        return
+    end
+
+    local row = grid[y]
+
+    if row then
+        local cellValue = row[x] or VALUE_SPACE
+
+        if type( cellValue ) == "string" then
+            cellValue = string.byte( cellValue )
+        end
+
+        return cellValue
+    else
+        aargh()
+        return
+    end
+end
+
+setCellAbove = function ( x, y, value )
+    y = y - 1
+    setCell( x, y, value )
+end
+
+setCellBelow = function ( x, y, value )
+    y = y + 1
+    setCell( x, y, value )
+end
+
+setCell = function ( x, y, value )
+    if not pointIsInBounds( x, y ) then
+        aargh()
+        return
+    end
+
+    if grid[y] then
+        grid[y][x] = value
+    end
+end
+
+local function getProgramWidth( inputStr )
+    programWidth = 0
+
+    for line in string.gmatch( inputStr, "(.-)\n" ) do
+        if #line > programWidth then
+            programWidth = #line
+        end
+    end
+
+    return programWidth
+end
+
+local stepCount = 0
+
+-- Main execution function --
+local function programStep()
+    --[[
+    if programHalted then
+        return
+    end
+    ]]
+
+    stepCount = stepCount + 1
+    wire.ports.STEP = tostring( stepCount )
+    movePointer()
+    --print( "STACK:" )
+    --printTable( stack.data )
+
+    if not pointIsInBounds( pointerX, pointerY ) then
+        aargh()
+        return
+    end
+
+    local nextInstruction
+
+    if grid[pointerY] then
+        nextInstruction = grid[pointerY][pointerX]
+    else
+        aargh()
+        return
+    end
+
+    if nextInstruction == "q" then
+        print( "Yarr! Yer booty has been plundered! (Program Ended.)" )
+        wire.ports.COMPLETE = "TRUE"
+        return
+    end
+
+    if not commands[nextInstruction] then
+        aargh()
+        return
+    end
+
+    wire.ports.STACK = table.concat( stack.data, " " )
+    commands[nextInstruction]()
+    wire.ports.POINTER_DIR = debugDir[executionDirection]
+    timer.simple( programStepInterval, programStep )
+end
+
+
+-- Read in input data --
+local function generateGrid( inputStr )
+    if inputStr:sub( -1 ) ~= "\n" then
+        inputStr = inputStr .. "\n"
+    end
+
+    local grid = {}
+    programWidth = getProgramWidth( inputStr ) -- Set the program width
+    local lineCount = 0
+
+    for line in string.gmatch( inputStr, "(.-)\n" ) do
+        lineCount = lineCount + 1
+        local numSpaces = programWidth - #line
+        line = line .. string.rep(" ", numSpaces)
+
+        --[[
+        if #line ~= programWidth then
+            error( "Error during setup: Input line lengths must be equal!" )
+        end
+        ]]
+
+        if #line > MAX_COLUMNS then
+            error( "Error during setup: Aargh! supports no more than 80 columns!" )
+        end
+
+        local row = {}
+
+        for i = 1, programWidth do
+            local char = line:sub( i, i )
+            if char then
+                table.insert( row, char )
+            else
+                table.insert( row, " " )
+            end
+        end
+
+        table.insert( grid, row )
+    end
+
+    -- Add an additional row to account for any data being written below the scope of the program.
+    local row = {}
+
+    for i = 1, programWidth do
+        table.insert( row, " " )
+    end
+    table.insert( grid, row )
+    lineCount = lineCount + 1
+    programHeight = lineCount -- Set the program height
+
+    --print( lineCount )
+
+    return grid
+end
+
+-- TESTING --
+local inputStr
+
+-- Cat program (repeats back the input) - Thanks Truttle1!
+--[[
+stdin = "ptlaaxobimwroe"
+
+inputStr = [[
+lllllgllj
+k       j
+k   jShhh
+k   j
+k   ldlfj
+k    !  j
+k  jhRAPh
+khhx
+   q
+]]
+
+
+-- Outputs "hello, world
+
+inputStr = [[
+j       world
+lppppppPPPPPPsrfj
+ hello,      *  j
+              qPh
+]]
+
+-- Tests the pointer movement
+--[[
+inputStr = [[
+jq
+lk
+]]
+
+--[[
+-- Truth Machine
+stdin = "1"
+
+inputStr = [[
+lglj
+   j
+jShh
+lrllxpq
+ 0jph0
+  j1k
+  llk
+]]
+
+-- 99 Bottles of Beer
+inputStr = [[
+lsdllDsalrxdarxsL       HshDppppppppppppppppppppppppppppppppppppsrddffj
+ *    e124j 21lDsJ       DD No more bottles of beer on the wall.*     j
+jhhDfdFdRAhDh   q         s      HDh        jfppppppppppppppppppppppPPh
+j                    0  lllllllllllJ        j !reeb erom yub ot emiT
+lsllSsrfsrflllllllsrfSj kphhhhph            lPq
+j0   KA KA        21  H   0 D  k
+lDlllllRxlAllllfsjllRxlDlFRxklFk
+      k lfsrfj  0jk  lfsrfjlak              The classic
+      k   21 jjShhk    21 j 0               99 bottles of beer
+      khhShhAhllllkhhhShhAh                 in Argh!
+                 q h         l   lsK
+                 lDSdllllllflSJh hJ*        wilde@sha-bang.de
+  jfrsppppppppppppppppppppppppppppph
+  j  *,llaw eht no reeb fo selttob
+  lPllllllllllllllllllllDSlllllllssK
+                         JSfdDh  fJo
+        jdrsppppppppppppppppppppppph
+   jfhhhh  *,...reeeeeb fo selttob
+   j Take one down, pass it around,
+   lPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPfj
+                                s/  j
+                         lKhhhhhSSDPh
+                         lDfSllllK /
+jffdrsppppppppppppppppppppppppppppph
+j    *.llaw eht no reeb fo selttob
+lPPlDSlllllllllllllllllllllllllllssK
+                                 fJ
+]]
+
+hook.add( "input", "debugStep", function( inp, val )
+    if val == 1 then programStep()
+        --print( "DBG: PROGRAM STEP" )
+    end
+end )
+
+wire.ports.INPUTSTR = ""
+wire.ports.INPUTSTR = inputStr
+
+stdoutPrintEnabled = false
+wire.ports.STDOUT = ""
+wire.ports.COMPLETE = "FALSE"
+
+grid = generateGrid( inputStr )
+print( "Starting in 1 second..." )
+timer.simple( 1, programStep )
